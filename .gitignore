@@ -1,0 +1,4 @@
+data/*.gz
+data/*.db
+venv/
+old-stages/
