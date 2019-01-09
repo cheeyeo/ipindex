@@ -9,6 +9,7 @@ find what IP address blocks contain certain keywords.
 
 Currently the application allows the following:
 
+  - Download WHOIS data for most registars
   - Create a MongoDB dump with all WHOIS registars:
     - RIPE IPv4 & IPv6
     - ARIN
@@ -19,9 +20,9 @@ Currently the application allows the following:
 **TODO**
 
   - Create better searching
-  - Download directly via python.
   - Create daily export.
   - Add support for LACNIC
+  - Create web application
 
 ## Development
 
@@ -53,7 +54,7 @@ solution as I wanted to import the data every day if possible.
 
 During this investigation I found that MongoDB was super quick at importing
 from a backup file using **mongoimport**. It takes about 4 minutes to parse and
-import 5 million netblock details using this method!
+import 6 million netblock details using this method!
 
 [1]: https://www.flumps.org/ip/
 [2]: http://bgplay.routeviews.org/

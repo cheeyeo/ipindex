@@ -3,30 +3,51 @@ import re
 import pymongo
 import gzip
 import json
-import uuid
 
-from pymongo import MongoClient, ReplaceOne
-from datetime import datetime, timedelta
+from contextlib import closing
+from urllib.request import urlopen
+from pymongo import MongoClient
 from netaddr import iprange_to_cidrs
 
 # mongo settings
 DB_HOST = "localhost"
 DB_PORT = 27017
-DB_WRITE_CHUNK = 50000
 
 FILE_LIST = {
-    "ripe": "ripe.db.inetnum.gz",
-    "ripe-ipv6": "ripe.db.inet6num.gz",
-    "arin": "arin.db",
-    "afrinic": "afrinic.db.gz",
-    "apnic": "apnic.db.inetnum.gz",
-    "apnic-ipv6": "apnic.db.inet6num.gz",
+    "ripe": [
+        "ripe.db.inetnum.gz",
+        "ftp://ftp.ripe.net/ripe/dbase/split/ripe.db.inetnum.gz",
+    ],
+    "ripe-ipv6": [
+        "ripe.db.inet6num.gz",
+        "ftp://ftp.ripe.net/ripe/dbase/split/ripe.db.inet6num.gz",
+    ],
+    "arin": ["arin.db", "ftp://ftp.arin.net/pub/rr/arin.db"],
+    "afrinic": [
+        "afrinic.db.gz",
+        "ftp://ftp.afrinic.net/pub/dbase/afrinic.db.gz",
+    ],
+    "apnic": [
+        "apnic.db.inetnum.gz",
+        "ftp://ftp.apnic.net/pub/apnic/whois/apnic.db.inetnum.gz",
+    ],
+    "apnic-ipv6": [
+        "apnic.db.inet6num.gz",
+        "ftp://ftp.apnic.net/pub/apnic/whois/apnic.db.inet6num.gz",
+    ],
 }
 
 
 @click.group()
 def cli():
     pass
+
+
+def download_file(url, name):
+
+    with closing(urlopen(url)) as source:
+        with open(name, "wb") as target:
+            target.write(source.read())
 
 
 def connect_mongodb():
@@ -147,28 +168,38 @@ def read_blocks(filename: str) -> list:
 
 def parse_blocks(blocks, source):
 
-    for block in blocks:
+    with open("data.json", "a") as file:
+        for block in blocks:
 
-        data = {
-            "inetnum": parse_property_inetnum(block),
-            "netname": parse_property(block, "netname"),
-            "description": parse_property(block, "descr"),
-            "country": parse_property(block, "country"),
-            "maintained_by": parse_property(block, "mnt-by"),
-            "created": parse_property(block, "created"),
-            "last_modified": parse_property(block, "last-modified"),
-            "source": source,
-        }
+            data = {
+                "inetnum": parse_property_inetnum(block),
+                "netname": parse_property(block, "netname"),
+                "description": parse_property(block, "descr"),
+                "country": parse_property(block, "country"),
+                "maintained_by": parse_property(block, "mnt-by"),
+                "created": parse_property(block, "created"),
+                "last_modified": parse_property(block, "last-modified"),
+                "source": source,
+            }
 
-        with open("data.json", "a") as file:
             json.dump(data, file)
-        file.close()
 
 
 @cli.command()
 @click.option("--parse", is_flag=True, help="import DB files", required=False)
 @click.option("--search", help="import DB files", required=False)
-def main(parse, search):
+@click.option(
+    "--download",
+    is_flag=True,
+    help="download all WHOIS data files",
+    required=False,
+)
+def main(parse, search, download):
+
+    if download:
+        for key, value in FILE_LIST.items():
+            click.secho("[INFO] downloading %s" % key.upper(), fg="green")
+            download_file(value[1], "data/" + value[0])
 
     if search:
         tmp_data = []
@@ -188,7 +219,7 @@ def main(parse, search):
         for key, value in FILE_LIST.items():
 
             click.secho("[INFO] parsing %s" % key.upper(), fg="green")
-            blocks = read_blocks("data/" + value)
+            blocks = read_blocks("data/" + value[0])
             click.secho("[INFO] netblocks found %s" % NUM_BLOCKS, fg="green")
 
             result = parse_blocks(blocks, key.upper())
