@@ -2,6 +2,7 @@ import os
 import gzip
 import multiprocessing as mp
 import re
+import shutil
 from netaddr import iprange_to_cidrs
 from pymongo import MongoClient
 from pymongo import InsertOne
@@ -12,28 +13,14 @@ from pymongo.write_concern import WriteConcern
 DB_HOST = "localhost"
 DB_PORT = 27017
 
-def parse_block(block, source):
-  data = {
-    "inetnum": parse_property_inetnum(block),
-    "netname": parse_property(block, "netname"),
-    "description": parse_property(block, "descr"),
-    "country": parse_property(block, "country"),
-    "maintained_by": parse_property(block, "mnt-by"),
-    "created": parse_property(block, "created"),
-    "last_modified": parse_property(block, "last-modified"),
-    "source": source
-  }
-
-  return data
-
-def parse_property(block: str, name: str):
-    match = re.findall(u"^{0:s}:\s*(.*)$".format(name), block, re.MULTILINE)
+def parse_property(block, name):
+    match = re.findall(u"{0:s}:(.+?)(?=\|.+\:)".format(name), block)
     if match:
-        return " ".join(match)
+        return " ".join(match).strip()
     else:
         return None
 
-def parse_property_inetnum(block: str):
+def parse_property_inetnum(block):
     # IPv4
     match = re.findall(
         "^inetnum:[\s]*((?:\d{1,3}\.){3}\d{1,3}[\s]*-[\s]*(?:\d{1,3}\.){3}\d{1,3})",
@@ -61,16 +48,23 @@ def parse_property_inetnum(block: str):
         if match:
             return match[0]
 
-def chunkify(size=1024*1024):
-  fileEnd = os.path.getsize("data/ripe.db.inetnum")
+# get_uncompressed_size returns the actual uncompressed file size of a gzip archive
+def get_uncompressed_size(file):
+  pipe_in = os.popen('gzip -l %s' % file)
+  list_1 = pipe_in.readlines()
+  list_2 = list_1[1].split()
+  c , u , r , n = list_2
+  return int(u)
+
+def chunkify(filename, size=1024*1024):
+  fileEnd = os.path.getsize(filename)
   print("ORIG FILE SIZE:", fileEnd)
 
-  with open("data/ripe.db.inetnum", "rb") as f:
+  with open(filename, "rb") as f:
     chunkEnd = f.tell()
     while True:
       chunkStart = chunkEnd
       f.seek(size, 1)
-      # f.readline()
 
       # incomplete line
       l = f.readline()
@@ -79,21 +73,21 @@ def chunkify(size=1024*1024):
       while l and b"% RIPE-USER-RESOURCE" in l:
         p = f.tell()
         l = f.readline()
+        l = f.readline()
         f.seek(p) # revert one line
-
 
       chunkEnd = f.tell()
       yield chunkStart, chunkEnd - chunkStart
       if chunkEnd > fileEnd:
         break
 
-def process_wrapper(chunkStart, chunkSize):
+def process_wrapper(chunkStart, chunkSize, filename):
   print("Process id:", os.getpid())
 
   single_block = ""
   blocks = []
 
-  with open("data/ripe.db.inetnum", mode="rt", encoding="ISO-8859-1") as f:
+  with open(filename, mode="rt", encoding="ISO-8859-1") as f:
     f.seek(chunkStart)
     lines = f.read(chunkSize).splitlines()
 
@@ -112,12 +106,12 @@ def process_wrapper(chunkStart, chunkSize):
         else:
           single_block = ""
       else:
-        single_block += line
+        single_block += line + '|'
 
-    print(blocks[0])
-    print(blocks[1])
-    print("LEN OF BLOCKS: {:d}".format(len(blocks)))
-  return blocks
+  parsed_blocks = parse_blocks(blocks, "RIPE")
+  print("Parsed {:d} records".format(len(parsed_blocks)))
+  print("Example parsed record: {}".format(parsed_blocks[0]))
+  return parsed_blocks
 
 def parse_blocks(blocks, source):
   res = list()
@@ -176,31 +170,36 @@ def update_mongodb(client, data):
   client.close()
   return True
 
-
 def main():
-  client = connect_mongodb()
+  # client = connect_mongodb()
   pool = mp.Pool(4)
   jobs = []
 
-  for chunkStart, chunkSize in chunkify():
+  archive = "data/ripe.db.inetnum.gz"
+  filename = "data/ripe.db.inetnum"
+  # extract gzip file
+  with gzip.open(archive, mode="rb") as f_in:
+    with open(filename, "wb") as f_out:
+      shutil.copyfileobj(f_in, f_out)
+
+  for chunkStart, chunkSize in chunkify(filename):
     print("chunkStart: {}, chunkSize: {}".format(chunkStart, chunkSize))
-    jobs.append(pool.apply_async(process_wrapper,(chunkStart,chunkSize)))
+    jobs.append(pool.apply_async(process_wrapper,(chunkStart,chunkSize, filename)))
+
+  # delete extracted file
+  os.remove(filename)
 
   count = 0
   for job in jobs:
     blocks = job.get()
     count += len(blocks)
-    print("ITEM IN BLOCK: ", blocks[-1])
-    print("SIZE OF BLOCKS RETURNED: ", len(blocks))
+    # res = update_mongodb(client, blocks)
+    # print("Mongodb Update: ", res)
 
-    parsed = parse_blocks(blocks, "RIPE")
-    res = update_mongodb(client, parsed)
-    print("MONGO UPDATE: ", res)
-
-  print("TOTAL RECORDS: ", count)
+  print("Finished importing all records")
+  print("Total records imported: {:d}".format(count))
   pool.close()
   exit(0)
-
 
 if __name__ == "__main__":
   main()
