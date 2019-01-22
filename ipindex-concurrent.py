@@ -2,23 +2,50 @@ import os
 import gzip
 import multiprocessing as mp
 import re
-import shutil
+import uuid
 from netaddr import iprange_to_cidrs
+import pymongo
 from pymongo import MongoClient
-from pymongo import InsertOne
 from pymongo.write_concern import WriteConcern
 
 
 # mongo settings
-DB_HOST = "localhost"
+DB_HOST = "127.0.0.1"
 DB_PORT = 27017
 
+FILE_LIST = {
+    "ripe": [
+      "ripe.db.inetnum.gz",
+      "ftp://ftp.ripe.net/ripe/dbase/split/ripe.db.inetnum.gz",
+    ],
+    # "ripe-ipv6": [
+    #   "ripe.db.inet6num.gz",
+    #   "ftp://ftp.ripe.net/ripe/dbase/split/ripe.db.inet6num.gz",
+    # ],
+    # "arin": [
+    #   "arin.db",
+    #   "ftp://ftp.arin.net/pub/rr/arin.db"
+    # ],
+    # "afrinic": [
+    #   "afrinic.db.gz",
+    #   "ftp://ftp.afrinic.net/pub/dbase/afrinic.db.gz",
+    # ],
+    # "apnic": [
+    #   "apnic.db.inetnum.gz",
+    #   "ftp://ftp.apnic.net/pub/apnic/whois/apnic.db.inetnum.gz",
+    # ],
+    # "apnic-ipv6": [
+    #   "apnic.db.inet6num.gz",
+    #   "ftp://ftp.apnic.net/pub/apnic/whois/apnic.db.inet6num.gz",
+    # ],
+}
+
 def parse_property(block, name):
-    match = re.findall(u"{0:s}:(.+?)(?=\|.+\:)".format(name), block)
-    if match:
-        return " ".join(match).strip()
-    else:
-        return None
+  match = re.findall(u"^{0:s}:\s*(.*)$".format(name), block, re.MULTILINE)
+  if match:
+    return " ".join(match).strip()
+  else:
+    return None
 
 def parse_property_inetnum(block):
     # IPv4
@@ -48,75 +75,11 @@ def parse_property_inetnum(block):
         if match:
             return match[0]
 
-# get_uncompressed_size returns the actual uncompressed file size of a gzip archive
-def get_uncompressed_size(file):
-  pipe_in = os.popen('gzip -l %s' % file)
-  list_1 = pipe_in.readlines()
-  list_2 = list_1[1].split()
-  c , u , r , n = list_2
-  return int(u)
-
-def chunkify(filename, size=1024*1024):
-  fileEnd = os.path.getsize(filename)
-  print("ORIG FILE SIZE:", fileEnd)
-
-  with open(filename, "rb") as f:
-    chunkEnd = f.tell()
-    while True:
-      chunkStart = chunkEnd
-      f.seek(size, 1)
-
-      # incomplete line
-      l = f.readline()
-      l = f.readline()
-      if not l: return
-      while l and b"% RIPE-USER-RESOURCE" in l:
-        p = f.tell()
-        l = f.readline()
-        l = f.readline()
-        f.seek(p) # revert one line
-
-      chunkEnd = f.tell()
-      yield chunkStart, chunkEnd - chunkStart
-      if chunkEnd > fileEnd:
-        break
-
-def process_wrapper(chunkStart, chunkSize, filename):
-  print("Process id:", os.getpid())
-
-  single_block = ""
-  blocks = []
-
-  with open(filename, mode="rt", encoding="ISO-8859-1") as f:
-    f.seek(chunkStart)
-    lines = f.read(chunkSize).splitlines()
-
-    for line in lines:
-      if (
-      line.startswith("%")
-      or line.startswith("#")
-      or line.startswith("remarks:")
-      or line.startswith(" ")):
-        continue
-
-      if line.strip() == "":
-        if single_block.startswith("inetnum:") or single_block.startswith("inet6num:"):
-          blocks.append(single_block)
-          single_block = ""
-        else:
-          single_block = ""
-      else:
-        single_block += line + '|'
-
-  parsed_blocks = parse_blocks(blocks, "RIPE")
-  print("Parsed {:d} records".format(len(parsed_blocks)))
-  print("Example parsed record: {}".format(parsed_blocks[0]))
-  return parsed_blocks
-
 def parse_blocks(blocks, source):
   res = list()
   for block in blocks:
     data = {
+      "_id": str(uuid.uuid4()),
       "inetnum": parse_property_inetnum(block),
       "netname": parse_property(block, "netname"),
       "description": parse_property(block, "descr"),
@@ -130,11 +93,71 @@ def parse_blocks(blocks, source):
 
   return res
 
+def file_block(fp, number_of_blocks, block):
+  '''
+  A generator that splits a file into blocks and iterates
+  over the lines of one of the blocks.
+
+  '''
+  assert 0 <= block and block < number_of_blocks
+  assert 0 < number_of_blocks
+
+  fp.seek(0,2)
+  file_size = fp.tell()
+
+  ini = file_size * block / number_of_blocks
+  end = file_size * (1 + block) / number_of_blocks
+
+  if ini <= 0:
+    fp.seek(0)
+  else:
+    fp.seek(ini-1)
+    fp.readline()
+
+  while fp.tell() < end:
+    yield fp.readline()
+
+
+def process_wrapper(filename, num_workers, chunk_number, source):
+  print("Process id: {} Filename: {} Num workers: {} Chunk: {}".format(os.getpid(), filename, num_workers, chunk_number))
+
+  if filename.endswith(".gz"):
+    fp = gzip.open(filename, mode="rt", encoding="ISO-8859-1")
+  else:
+    fp = open(filename, mode="rt", encoding="ISO-8859-1")
+
+
+  single_block = ""
+  blocks = []
+
+  for line in file_block(fp, num_workers, chunk_number):
+    if (
+      line.startswith("%")
+      or line.startswith("#")
+      or line.startswith("remarks:")
+      or line.startswith(" ")):
+        continue
+
+    if line.strip() == "":
+      if single_block.startswith("inetnum:") or single_block.startswith("inet6num:"):
+        blocks.append(single_block)
+        single_block = ""
+      else:
+        single_block = ""
+    else:
+      single_block += line
+
+  fp.close()
+  parsed_blocks = parse_blocks(blocks, source)
+  print("Parsed {:d} records".format(len(parsed_blocks)))
+  return parsed_blocks
+
+
 def connect_mongodb():
   """ mongodb connection """
   try:
     client = MongoClient(
-        DB_HOST, DB_PORT, maxPoolSize=200, serverSelectionTimeoutMS=10
+        DB_HOST, DB_PORT, maxPoolSize=200, serverSelectionTimeoutMS=20
     )
     client.server_info()
   except pymongo.errors.ServerSelectionTimeoutError:
@@ -145,61 +168,58 @@ def connect_mongodb():
 
 def update_mongodb(client, data):
   """ update mongodb record """
-  print("Inside update mongodb with thread {}".format(os.getpid()))
-  print(client)
+  print("Inside update mongodb with process {}".format(os.getpid()))
 
   db = client['ipindex']
-
   # write concern sets journal to False?
   coll = db.get_collection('items', write_concern=WriteConcern(j=False))
 
-  # Disable indexes during import for faster access
-  # Reindex collection afterwards
-  coll.drop_indexes()
-
-  items = [InsertOne(d) for d in data]
-
-  print('ITEMS LENGTH: {:d}'.format(len(items)))
-  print('CREATED ITEMS: {}'.format(items[0]))
-
   try:
-    coll.bulk_write(items, ordered=False)
+    coll.insert_many(data, ordered=False)
+  except pymongo.errors.BulkWriteError as e:
+    print("[Error] Error with bulk update of db records: ", e.details['writeErrors'])
   except RuntimeError:
     print("[ERROR] failed to update db record")
 
   client.close()
   return True
 
+def remove_indexes(client, collection):
+  db = client['ipindex']
+  # write concern sets journal to False?
+  coll = db.get_collection(collection)
+  coll.drop_indexes()
+
+def rebuild_indexes(client, collection):
+  pass
+
+
 def main():
-  # client = connect_mongodb()
-  pool = mp.Pool(4)
+  client = connect_mongodb()
+
+  num_workers = 4
+  pool = mp.Pool(num_workers)
   jobs = []
 
-  archive = "data/ripe.db.inetnum.gz"
-  filename = "data/ripe.db.inetnum"
-  # extract gzip file
-  with gzip.open(archive, mode="rb") as f_in:
-    with open(filename, "wb") as f_out:
-      shutil.copyfileobj(f_in, f_out)
+  for key, value in FILE_LIST.items():
+    filename = "data/" + value[0]
 
-  for chunkStart, chunkSize in chunkify(filename):
-    print("chunkStart: {}, chunkSize: {}".format(chunkStart, chunkSize))
-    jobs.append(pool.apply_async(process_wrapper,(chunkStart,chunkSize, filename)))
+    for chunk_number in range(num_workers):
+      jobs.append(pool.apply_async(process_wrapper,(filename, num_workers, chunk_number, key.upper())))
 
-  # delete extracted file
-  os.remove(filename)
+    count = 0
+    for job in jobs:
+      blocks = job.get()
+      print("RETURNED BLOCKS: ", len(blocks))
+      count += len(blocks)
+      res = update_mongodb(client, blocks)
+      print("Mongodb Update: ", res)
 
-  count = 0
-  for job in jobs:
-    blocks = job.get()
-    count += len(blocks)
-    # res = update_mongodb(client, blocks)
-    # print("Mongodb Update: ", res)
+    print("Total records imported: {:d}".format(count))
 
-  print("Finished importing all records")
-  print("Total records imported: {:d}".format(count))
   pool.close()
   exit(0)
+
 
 if __name__ == "__main__":
   main()
