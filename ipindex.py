@@ -1,6 +1,5 @@
-import click
+import os
 import re
-import pymongo
 import gzip
 import json
 import multiprocessing as mp
@@ -9,6 +8,7 @@ from netaddr import iprange_to_cidrs
 from itertools import groupby
 from contextlib import closing
 from urllib.request import urlopen
+import click
 import pymongo
 from pymongo import MongoClient
 from pymongo.write_concern import WriteConcern
@@ -60,7 +60,6 @@ def download_file(url, name):
     with open(name, "wb") as target:
       target.write(source.read())
 
-
 def connect_mongodb():
   """ mongodb connection """
   try:
@@ -73,7 +72,6 @@ def connect_mongodb():
     exit(1)
 
   return client
-
 
 def update_mongodb(client, data):
   """ update mongodb record """
@@ -105,37 +103,53 @@ def search_mongodb(client, field, query):
 def parse_property(block: str, name: str):
   match = re.findall(u"^{0:s}:\s*(.*)$".format(name), block, re.MULTILINE)
   if match:
-      return " ".join(match)
+    return " ".join(match)
   else:
-      return None
+    return None
 
 def parse_property_inetnum(block: str):
   # IPv4
   match = re.findall(
-      "^inetnum:[\s]*((?:\d{1,3}\.){3}\d{1,3}[\s]*-[\s]*(?:\d{1,3}\.){3}\d{1,3})",
-      block,
-      re.MULTILINE,
+    "^inetnum:[\s]*((?:\d{1,3}\.){3}\d{1,3}[\s]*-[\s]*(?:\d{1,3}\.){3}\d{1,3})",
+    block,
+    re.MULTILINE,
   )
   if match:
-      ip_start = re.findall(
-          "^inetnum:[\s]*((?:\d{1,3}\.){3}\d{1,3})[\s]*-[\s]*(?:\d{1,3}\.){3}\d{1,3}",
-          block,
-          re.MULTILINE,
-      )[0]
-      ip_end = re.findall(
-          "^inetnum:[\s]*(?:\d{1,3}\.){3}\d{1,3}[\s]*-[\s]*((?:\d{1,3}\.){3}\d{1,3})",
-          block,
-          re.MULTILINE,
-      )[0]
-      cidrs = iprange_to_cidrs(ip_start, ip_end)
-      return "{}".format(cidrs[0])
+    ip_start = re.findall(
+        "^inetnum:[\s]*((?:\d{1,3}\.){3}\d{1,3})[\s]*-[\s]*(?:\d{1,3}\.){3}\d{1,3}",
+        block,
+        re.MULTILINE,
+    )[0]
+    ip_end = re.findall(
+        "^inetnum:[\s]*(?:\d{1,3}\.){3}\d{1,3}[\s]*-[\s]*((?:\d{1,3}\.){3}\d{1,3})",
+        block,
+        re.MULTILINE,
+    )[0]
+    cidrs = iprange_to_cidrs(ip_start, ip_end)
+    return "{}".format(cidrs[0])
   # IPv6
   else:
-      match = re.findall(
-          "^inet6num:[\s]*([0-9a-fA-F:\/]{1,43})", block, re.MULTILINE
-      )
-      if match:
-          return match[0]
+    match = re.findall(
+        "^inet6num:[\s]*([0-9a-fA-F:\/]{1,43})", block, re.MULTILINE
+    )
+    if match:
+      return match[0]
+
+def parse_blocks(blocks, source):
+  res = list()
+  for block in blocks:
+    data = {
+      "inetnum": parse_property_inetnum(block),
+      "netname": parse_property(block, "netname"),
+      "description": parse_property(block, "descr"),
+      "country": parse_property(block, "country"),
+      "maintained_by": parse_property(block, "mnt-by"),
+      "created": parse_property(block, "created"),
+      "last_modified": parse_property(block, "last-modified"),
+      "source": source,
+    }
+    res.append(data)
+  return res
 
 def file_block(fp, number_of_blocks, block):
   '''
@@ -160,7 +174,11 @@ def file_block(fp, number_of_blocks, block):
   while fp.tell() < end:
     yield fp.readline()
 
-def make_grouper(tag):
+def make_group(tag):
+  '''
+  grouping function that scans a specific line for pattern
+  given in tag; used in group_by as a key selector
+  '''
   counter = 0
   def key(line):
     nonlocal counter
@@ -168,22 +186,6 @@ def make_grouper(tag):
       counter += 1
     return counter
   return key
-
-def parse_blocks(blocks, source):
-  res = list()
-  for block in blocks:
-    data = {
-      "inetnum": parse_property_inetnum(block),
-      "netname": parse_property(block, "netname"),
-      "description": parse_property(block, "descr"),
-      "country": parse_property(block, "country"),
-      "maintained_by": parse_property(block, "mnt-by"),
-      "created": parse_property(block, "created"),
-      "last_modified": parse_property(block, "last-modified"),
-      "source": source,
-    }
-    res.append(data)
-  return res
 
 def process(num_workers, chunk_number, filename, source):
   print("Process id:", os.getpid())
@@ -199,7 +201,7 @@ def process(num_workers, chunk_number, filename, source):
   count = 0
   client = connect_mongodb()
 
-  for k, group in groupby(fbp, key=make_grouper(tag)):
+  for k, group in groupby(fbp, key=make_group(tag)):
     blocks.append(''.join(group))
     # for every 1000 records we parse and save to db
     if len(blocks) >= 1000:
