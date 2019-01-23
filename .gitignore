@@ -3,3 +3,4 @@ data/*.db
 data.json
 venv/
 old-stages/
+.DS_Store
